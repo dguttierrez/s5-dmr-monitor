@@ -31,6 +31,7 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "sample_event": None, "destination_samples": [], "parse_errors": 0,
           "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None,
           "history_queries_sent": 0, "last_history_query_utc": None,
+          "socket_event_counts": {}, "socket_event_samples": {}, "history_candidates": 0,
           "watch_call": WATCH_CALL, "watch_call_events": 0, "watch_call_recent": [],
           "mqtt_topics": {}, "recent_target_events": [],
           "filtered_connections": {str(tg): {"connected": False, "messages": 0, "matches": 0,
@@ -161,6 +162,10 @@ def listener():
             status["connected"] = False
         log.warning("BrandMeister Last Heard disconnected")
 
+    @sio.on("*")
+    def on_any_event(event_name, *args):
+        examine_socket_event(event_name, args)
+
     @sio.on("mqtt")
     def on_mqtt(data):
         try:
@@ -226,6 +231,49 @@ def listener():
 
 
 
+def examine_socket_event(event_name, args, tg=None):
+    """Record Socket.IO event names and consume historical result envelopes.
+    Never expose full payloads publicly: diagnostics show only structure.
+    """
+    with status_lock:
+        counts = status["socket_event_counts"]
+        counts[event_name] = counts.get(event_name, 0) + 1
+        if event_name not in status["socket_event_samples"]:
+            first = args[0] if args else None
+            if isinstance(first, dict):
+                sample = {"type": "object", "keys": list(first.keys())[:30]}
+            elif isinstance(first, list):
+                sample = {"type": "array", "count": len(first)}
+            else:
+                sample = {"type": type(first).__name__}
+            status["socket_event_samples"][event_name] = sample
+    # The live MQTT stream is handled by the existing callback. Never duplicate it.
+    if event_name == "mqtt":
+        return
+    def walk(value, depth=0):
+        if depth > 4:
+            return
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                return
+        if isinstance(value, list):
+            for item in value[:HISTORY_AMOUNT * 2]:
+                walk(item, depth + 1)
+        elif isinstance(value, dict):
+            if "DestinationID" in value and "Start" in value:
+                with status_lock:
+                    status["history_candidates"] += 1
+                ingest(value)
+            else:
+                for field in ("payload", "data", "records", "results", "items", "history", "sessions"):
+                    if field in value:
+                        walk(value[field], depth + 1)
+    for arg in args[:2]:
+        walk(arg)
+
+
 def filtered_listener(tg):
     """One independent Socket.IO connection per talkgroup, as in the LH UI."""
     sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False, request_timeout=15)
@@ -238,7 +286,8 @@ def filtered_listener(tg):
             status["filtered_connections"][key]["last_error"] = None
         # Subscribe to live traffic and query history; inspect both separately.
         sio.emit("join", "everything")
-        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT})
+        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT},
+                 callback=lambda *args: examine_socket_event("searchHistory:ack", args, tg=tg))
         with status_lock:
             status["filtered_connections"][key]["history_queries"] += 1
         log.info("TG %s dedicated Last Heard searchHistory request sent", tg)
@@ -247,6 +296,10 @@ def filtered_listener(tg):
     def disconnect():
         with status_lock:
             status["filtered_connections"][key]["connected"] = False
+
+    @sio.on("*")
+    def on_other_event(event_name, *args):
+        examine_socket_event(event_name, args, tg=tg)
 
     @sio.on("mqtt")
     def filtered_mqtt(data):
@@ -269,6 +322,8 @@ def filtered_listener(tg):
                         stats["matches"] += 1
             if isinstance(event, dict):
                 ingest(event)
+            elif isinstance(event, list):
+                examine_socket_event("mqtt:array", (event,), tg=tg)
         except (ValueError, TypeError, sqlite3.Error):
             log.exception("Invalid TG %s filtered message", tg)
 
