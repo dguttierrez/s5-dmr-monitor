@@ -24,7 +24,8 @@ BM_PATH = os.getenv("BM_SOCKET_PATH", "lh/socket.io").lstrip("/")
 status_lock = threading.Lock()
 status = {"connected": False, "last_event_utc": None, "last_error": None,
           "events_received": 0, "events_target_tg": 0, "events_saved": 0,
-          "last_target_event": None, "last_rejection": None}
+          "last_target_event": None, "last_rejection": None,
+          "sample_event": None, "destination_samples": [], "parse_errors": 0}
 shutdown = threading.Event()
 
 
@@ -139,7 +140,28 @@ def listener():
             with status_lock:
                 status["last_event_utc"] = datetime.now(timezone.utc).isoformat()
                 status["events_received"] += 1
-            ingest(payload)
+            try:
+                decoded = json.loads(payload) if isinstance(payload, str) else payload
+                if isinstance(decoded, dict) and "payload" in decoded and "DestinationID" not in decoded:
+                    decoded = decoded["payload"]
+                    decoded = json.loads(decoded) if isinstance(decoded, str) else decoded
+                if isinstance(decoded, dict):
+                    with status_lock:
+                        if status["sample_event"] is None:
+                            status["sample_event"] = {k: str(v)[:120] for k, v in decoded.items()}
+                            log.info("First Last Heard payload fields: %s", list(decoded))
+                        dst = str(decoded.get("DestinationID", "<missing>"))
+                        if dst not in status["destination_samples"] and len(status["destination_samples"]) < 25:
+                            status["destination_samples"].append(dst)
+                    ingest(decoded)
+                else:
+                    with status_lock:
+                        status["parse_errors"] += 1
+                    log.warning("Unexpected mqtt decoded type: %s", type(decoded).__name__)
+            except (ValueError, TypeError) as ex:
+                with status_lock:
+                    status["parse_errors"] += 1
+                log.warning("Invalid mqtt JSON: %s", ex)
         except Exception:
             log.exception("Failed handling MQTT event")
 
