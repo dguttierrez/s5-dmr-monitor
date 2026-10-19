@@ -22,7 +22,9 @@ RETENTION = max(1, int(os.getenv("RETENTION_DAYS", "30")))
 BM_URL = os.getenv("BM_URL", "https://api.brandmeister.network")
 BM_PATH = os.getenv("BM_SOCKET_PATH", "lh/socket.io").lstrip("/")
 status_lock = threading.Lock()
-status = {"connected": False, "last_event_utc": None, "last_error": None}
+status = {"connected": False, "last_event_utc": None, "last_error": None,
+          "events_received": 0, "events_target_tg": 0, "events_saved": 0,
+          "last_target_event": None, "last_rejection": None}
 shutdown = threading.Event()
 
 
@@ -62,18 +64,34 @@ def ingest(payload, now=None):
     try:
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if isinstance(payload, dict) and "payload" in payload and "DestinationID" not in payload:
+            payload = payload["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
         if not isinstance(payload, dict):
             return False
         tg = as_int(payload.get("DestinationID"))
-        if tg not in GROUPS or payload.get("Event") != "Session-Stop":
+        if tg not in GROUPS:
+            return False
+        with status_lock:
+            status["events_target_tg"] += 1
+            status["last_target_event"] = {"tg": tg, "event": str(payload.get("Event")),
+                                            "start": payload.get("Start"), "stop": payload.get("Stop")}
+        if payload.get("Event") != "Session-Stop":
+            with status_lock:
+                status["last_rejection"] = "Event not Session-Stop"
             return False
         call = str(payload.get("SourceCall") or "").strip().upper()[:24]
         start = as_int(payload.get("Start"))
         stop = as_int(payload.get("Stop"))
         if not call or start <= 0 or stop < start or stop > now + 120 or stop < now - 3600:
+            with status_lock:
+                status["last_rejection"] = f"Invalid timestamps/call: call={bool(call)}, start={start}, stop={stop}, now={now}"
             return False
         duration = stop - start
         if duration > 3600:
+            with status_lock:
+                status["last_rejection"] = f"Duration out of range: {duration}"
             return False
         source_id = as_int(payload.get("SourceID"))
         repeater_id = as_int(payload.get("RepeaterID") or payload.get("Repeater"))
@@ -83,8 +101,15 @@ def ingest(payload, now=None):
                 (tg,callsign,source_name,source_id,repeater_id,start_ts,stop_ts,duration)
                 VALUES (?,?,?,?,?,?,?,?)""",
                 (tg,call,source_name,source_id,repeater_id,start,stop,duration))
+        if cur.rowcount:
+            with status_lock:
+                status["events_saved"] += 1
+                status["last_rejection"] = None
+            log.info("Saved TG %s from %s (%ss)", tg, call, duration)
         return cur.rowcount == 1
     except (ValueError, TypeError, sqlite3.Error) as ex:
+        with status_lock:
+            status["last_rejection"] = str(ex)[:160]
         log.warning("Rejected incoming event: %s", ex)
         return False
 
@@ -99,6 +124,7 @@ def listener():
             status["last_error"] = None
         log.info("Connected to BrandMeister Last Heard")
         sio.emit("join", "everything")
+        log.info("Subscribed to Last Heard (join/everything)")
 
     @sio.event
     def disconnect():
@@ -112,6 +138,7 @@ def listener():
             payload = data.get("payload") if isinstance(data, dict) else data
             with status_lock:
                 status["last_event_utc"] = datetime.now(timezone.utc).isoformat()
+                status["events_received"] += 1
             ingest(payload)
         except Exception:
             log.exception("Failed handling MQTT event")
