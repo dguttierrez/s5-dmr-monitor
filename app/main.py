@@ -19,6 +19,8 @@ DB = os.getenv("DATABASE_PATH", "/data/monitor.db")
 GROUPS = set(int(v.strip()) for v in os.getenv("TALKGROUPS", "293,29320").split(",") if v.strip())
 REFRESH = max(30, min(60, int(os.getenv("REFRESH_SECONDS", "45"))))
 RETENTION = max(1, int(os.getenv("RETENTION_DAYS", "30")))
+HISTORY_INTERVAL = max(120, int(os.getenv("HISTORY_INTERVAL_SECONDS", "180")))
+HISTORY_AMOUNT = max(10, min(200, int(os.getenv("HISTORY_AMOUNT", "100"))))
 BM_URL = os.getenv("BM_URL", "https://api.brandmeister.network")
 BM_PATH = os.getenv("BM_SOCKET_PATH", "lh/socket.io").lstrip("/")
 status_lock = threading.Lock()
@@ -26,7 +28,8 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "events_received": 0, "events_target_tg": 0, "events_saved": 0,
           "last_target_event": None, "last_rejection": None,
           "sample_event": None, "destination_samples": [], "parse_errors": 0,
-          "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None}
+          "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None,
+          "history_queries_sent": 0, "last_history_query_utc": None}
 shutdown = threading.Event()
 
 
@@ -80,14 +83,14 @@ def ingest(payload, now=None):
             status["last_target_seen_utc"] = datetime.now(timezone.utc).isoformat()
             status["last_target_event"] = {"tg": tg, "event": str(payload.get("Event")),
                                             "start": payload.get("Start"), "stop": payload.get("Stop")}
-        if payload.get("Event") != "Session-Stop":
-            with status_lock:
-                status["last_rejection"] = "Event not Session-Stop"
+        # History replies may carry LH-Startup or Session-Update rather than Session-Stop.
+        # A strictly positive Stop timestamp determines whether the QSO is complete.
+        if as_int(payload.get("Stop")) <= 0:
             return False
         call = str(payload.get("SourceCall") or "").strip().upper()[:24]
         start = as_int(payload.get("Start"))
         stop = as_int(payload.get("Stop"))
-        if not call or start <= 0 or stop < start or stop > now + 120 or stop < now - 3600:
+        if not call or start <= 0 or stop < start or stop > now + 120 or stop < now - RETENTION * 86400:
             with status_lock:
                 status["last_rejection"] = f"Invalid timestamps/call: call={bool(call)}, start={start}, stop={stop}, now={now}"
             return False
@@ -117,6 +120,16 @@ def ingest(payload, now=None):
         return False
 
 
+def request_history(sio):
+    # BrandMeister's own Last Heard dashboard issues searchHistory with a query object.
+    for tg in sorted(GROUPS):
+        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT})
+    with status_lock:
+        status["history_queries_sent"] += len(GROUPS)
+        status["last_history_query_utc"] = datetime.now(timezone.utc).isoformat()
+    log.info("Requested filtered Last Heard history: %s (amount=%d)", sorted(GROUPS), HISTORY_AMOUNT)
+
+
 def listener():
     sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False, request_timeout=15)
 
@@ -128,6 +141,7 @@ def listener():
         log.info("Connected to BrandMeister Last Heard")
         sio.emit("join", "everything")
         log.info("Subscribed to Last Heard (join/everything)")
+        request_history(sio)
 
     @sio.event
     def disconnect():
@@ -175,8 +189,11 @@ def listener():
     while not shutdown.is_set():
         try:
             sio.connect(BM_URL, socketio_path=BM_PATH, transports=["websocket"], wait_timeout=20)
+            last_history = time.monotonic()
             while sio.connected and not shutdown.wait(1):
-                pass
+                if time.monotonic() - last_history >= HISTORY_INTERVAL:
+                    request_history(sio)
+                    last_history = time.monotonic()
         except Exception as ex:
             with status_lock:
                 status["connected"] = False
