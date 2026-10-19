@@ -34,7 +34,7 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "watch_call": WATCH_CALL, "watch_call_events": 0, "watch_call_recent": [],
           "mqtt_topics": {}, "recent_target_events": [],
           "filtered_connections": {str(tg): {"connected": False, "messages": 0, "matches": 0,
-              "last_topic": None, "last_destination": None, "last_callsign": None,
+              "last_topic": None, "last_destination": None, "last_callsign": None, "history_queries": 0,
               "last_event_utc": None, "last_error": None} for tg in GROUPS}}
 shutdown = threading.Event()
 
@@ -154,7 +154,6 @@ def listener():
         log.info("Connected to BrandMeister Last Heard")
         sio.emit("join", "everything")
         log.info("Subscribed to Last Heard (join/everything)")
-        request_history(sio)
 
     @sio.event
     def disconnect():
@@ -211,11 +210,8 @@ def listener():
     while not shutdown.is_set():
         try:
             sio.connect(BM_URL, socketio_path=BM_PATH, transports=["websocket"], wait_timeout=20)
-            last_history = time.monotonic()
             while sio.connected and not shutdown.wait(1):
-                if time.monotonic() - last_history >= HISTORY_INTERVAL:
-                    request_history(sio)
-                    last_history = time.monotonic()
+                pass
         except Exception as ex:
             with status_lock:
                 status["connected"] = False
@@ -240,8 +236,11 @@ def filtered_listener(tg):
         with status_lock:
             status["filtered_connections"][key]["connected"] = True
             status["filtered_connections"][key]["last_error"] = None
-        # The official dashboard sends the history query on each new socket.
-        sio.emit("searchHistory", {"query": {"DestinationID": tg}, "amount": HISTORY_AMOUNT})
+        # Subscribe to live traffic and query history; inspect both separately.
+        sio.emit("join", "everything")
+        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT})
+        with status_lock:
+            status["filtered_connections"][key]["history_queries"] += 1
         log.info("TG %s dedicated Last Heard searchHistory request sent", tg)
 
     @sio.event
