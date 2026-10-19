@@ -36,6 +36,7 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "mqtt_topics": {}, "recent_target_events": [],
           "filtered_connections": {str(tg): {"connected": False, "messages": 0, "matches": 0,
               "last_topic": None, "last_destination": None, "last_callsign": None, "history_queries": 0,
+              "topic_counts": {}, "historical_matches": 0, "last_history_match": None,
               "last_event_utc": None, "last_error": None} for tg in GROUPS}}
 shutdown = threading.Event()
 
@@ -286,7 +287,7 @@ def filtered_listener(tg):
             status["filtered_connections"][key]["last_error"] = None
         # Subscribe to live traffic and query history; inspect both separately.
         sio.emit("join", "everything")
-        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT},
+        sio.emit("searchHistory", {"query": {"DestinationID": tg}, "amount": HISTORY_AMOUNT},
                  callback=lambda *args: examine_socket_event("searchHistory:ack", args, tg=tg))
         with status_lock:
             status["filtered_connections"][key]["history_queries"] += 1
@@ -313,6 +314,9 @@ def filtered_listener(tg):
                 stats = status["filtered_connections"][key]
                 stats["messages"] += 1
                 stats["last_topic"] = str(data.get("topic", "")) if isinstance(data, dict) else ""
+                topic_name = stats["last_topic"]
+                topics = stats["topic_counts"]
+                topics[topic_name] = topics.get(topic_name, 0) + 1
                 stats["last_event_utc"] = datetime.now(timezone.utc).isoformat()
                 if isinstance(event, dict):
                     seen_tg = str(event.get("DestinationID", "<missing>"))
@@ -320,6 +324,11 @@ def filtered_listener(tg):
                     stats["last_callsign"] = str(event.get("SourceCall", ""))[:24]
                     if as_int(event.get("DestinationID")) == tg:
                         stats["matches"] += 1
+                        if stats["last_topic"] == "LH-Startup":
+                            stats["historical_matches"] += 1
+                            stats["last_history_match"] = {
+                                "call": str(event.get("SourceCall", ""))[:24],
+                                "start": event.get("Start"), "stop": event.get("Stop")}
             if isinstance(event, dict):
                 ingest(event)
             elif isinstance(event, list):
