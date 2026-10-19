@@ -15,9 +15,10 @@ class IngestTests(unittest.TestCase):
                 self.assertTrue(main.ingest(event, now))
                 self.assertFalse(main.ingest(event, now))
                 self.assertFalse(main.ingest({**event,'DestinationID':91}, now))
-                self.assertFalse(main.ingest({**event,'Event':'Session-Start'}, now))
+                self.assertFalse(main.ingest({**event,'Event':'Session-Start', 'Stop':0}, now))
+                self.assertTrue(main.ingest({**event,'Event':'Session-Update', 'Start':now-7200, 'Stop':now-7100}, now))
                 self.assertFalse(main.ingest({**event,'Stop':now+1000}, now))
                 with main.connect_db() as db:
-                    self.assertEqual(db.execute('SELECT count(*) FROM transmissions').fetchone()[0], 1)
+                    self.assertEqual(db.execute('SELECT count(*) FROM transmissions').fetchone()[0], 2)
 
 if __name__=='__main__': unittest.main()
