@@ -32,7 +32,10 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None,
           "history_queries_sent": 0, "last_history_query_utc": None,
           "watch_call": WATCH_CALL, "watch_call_events": 0, "watch_call_recent": [],
-          "mqtt_topics": {}, "recent_target_events": []}
+          "mqtt_topics": {}, "recent_target_events": [],
+          "filtered_connections": {str(tg): {"connected": False, "messages": 0, "matches": 0,
+              "last_topic": None, "last_destination": None, "last_callsign": None,
+              "last_event_utc": None, "last_error": None} for tg in GROUPS}}
 shutdown = threading.Event()
 
 
@@ -226,6 +229,69 @@ def listener():
         shutdown.wait(15)
 
 
+
+def filtered_listener(tg):
+    """One independent Socket.IO connection per talkgroup, as in the LH UI."""
+    sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False, request_timeout=15)
+    key = str(tg)
+
+    @sio.event
+    def connect():
+        with status_lock:
+            status["filtered_connections"][key]["connected"] = True
+            status["filtered_connections"][key]["last_error"] = None
+        # The official dashboard sends the history query on each new socket.
+        sio.emit("searchHistory", {"query": {"DestinationID": tg}, "amount": HISTORY_AMOUNT})
+        log.info("TG %s dedicated Last Heard searchHistory request sent", tg)
+
+    @sio.event
+    def disconnect():
+        with status_lock:
+            status["filtered_connections"][key]["connected"] = False
+
+    @sio.on("mqtt")
+    def filtered_mqtt(data):
+        try:
+            payload = data.get("payload") if isinstance(data, dict) else data
+            event = json.loads(payload) if isinstance(payload, str) else payload
+            if isinstance(event, dict) and "payload" in event and "DestinationID" not in event:
+                event = event["payload"]
+                event = json.loads(event) if isinstance(event, str) else event
+            with status_lock:
+                stats = status["filtered_connections"][key]
+                stats["messages"] += 1
+                stats["last_topic"] = str(data.get("topic", "")) if isinstance(data, dict) else ""
+                stats["last_event_utc"] = datetime.now(timezone.utc).isoformat()
+                if isinstance(event, dict):
+                    seen_tg = str(event.get("DestinationID", "<missing>"))
+                    stats["last_destination"] = seen_tg
+                    stats["last_callsign"] = str(event.get("SourceCall", ""))[:24]
+                    if as_int(event.get("DestinationID")) == tg:
+                        stats["matches"] += 1
+            if isinstance(event, dict):
+                ingest(event)
+        except (ValueError, TypeError, sqlite3.Error):
+            log.exception("Invalid TG %s filtered message", tg)
+
+    while not shutdown.is_set():
+        try:
+            sio.connect(BM_URL, socketio_path=BM_PATH, transports=["websocket"], wait_timeout=20)
+            # Reconnect periodically, refreshing the filtered history request.
+            deadline = time.monotonic() + HISTORY_INTERVAL
+            while sio.connected and not shutdown.wait(1) and time.monotonic() < deadline:
+                pass
+        except Exception as exc:
+            with status_lock:
+                status["filtered_connections"][key]["last_error"] = str(exc)[:200]
+            log.warning("TG %s filtered connection failure: %s", tg, exc)
+        finally:
+            try:
+                sio.disconnect()
+            except Exception:
+                pass
+        shutdown.wait(15)
+
+
 def janitor():
     while not shutdown.wait(3600):
         try:
@@ -240,6 +306,8 @@ async def lifespan(app):
     prepare_db()
     shutdown.clear()
     threading.Thread(target=listener, name="brandmeister", daemon=True).start()
+    for tg in GROUPS:
+        threading.Thread(target=filtered_listener, args=(tg,), name=f"tg-{tg}", daemon=True).start()
     threading.Thread(target=janitor, name="retention", daemon=True).start()
     yield
     shutdown.set()
