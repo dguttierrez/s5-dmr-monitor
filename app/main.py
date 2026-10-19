@@ -25,7 +25,8 @@ status_lock = threading.Lock()
 status = {"connected": False, "last_event_utc": None, "last_error": None,
           "events_received": 0, "events_target_tg": 0, "events_saved": 0,
           "last_target_event": None, "last_rejection": None,
-          "sample_event": None, "destination_samples": [], "parse_errors": 0}
+          "sample_event": None, "destination_samples": [], "parse_errors": 0,
+          "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None}
 shutdown = threading.Event()
 
 
@@ -76,6 +77,7 @@ def ingest(payload, now=None):
             return False
         with status_lock:
             status["events_target_tg"] += 1
+            status["last_target_seen_utc"] = datetime.now(timezone.utc).isoformat()
             status["last_target_event"] = {"tg": tg, "event": str(payload.get("Event")),
                                             "start": payload.get("Start"), "stop": payload.get("Stop")}
         if payload.get("Event") != "Session-Stop":
@@ -151,6 +153,11 @@ def listener():
                             status["sample_event"] = {k: str(v)[:120] for k, v in decoded.items()}
                             log.info("First Last Heard payload fields: %s", list(decoded))
                         dst = str(decoded.get("DestinationID", "<missing>"))
+                        counts = status["destination_counts"]
+                        counts[dst] = counts.get(dst, 0) + 1
+                        kind = str(decoded.get("Event", "<missing>"))
+                        events = status["event_counts"]
+                        events[kind] = events.get(kind, 0) + 1
                         if dst not in status["destination_samples"] and len(status["destination_samples"]) < 25:
                             status["destination_samples"].append(dst)
                     ingest(decoded)
@@ -219,6 +226,10 @@ def health():
 def api_status():
     with status_lock:
         s = status.copy()
+    counts = s.pop("destination_counts", {})
+    s["top_destinations"] = [{"tg": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: -x[1])[:25]]
+    s["configured_tg_event_counts"] = {str(g): counts.get(str(g), 0) for g in sorted(GROUPS)}
+    s["distinct_destinations"] = len(counts)
     return {**s, "talkgroups": sorted(GROUPS), "refresh_seconds": REFRESH,
             "timestamp_utc": datetime.now(timezone.utc).isoformat()}
 
