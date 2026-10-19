@@ -21,6 +21,7 @@ REFRESH = max(30, min(60, int(os.getenv("REFRESH_SECONDS", "45"))))
 RETENTION = max(1, int(os.getenv("RETENTION_DAYS", "30")))
 HISTORY_INTERVAL = max(120, int(os.getenv("HISTORY_INTERVAL_SECONDS", "180")))
 HISTORY_AMOUNT = max(10, min(200, int(os.getenv("HISTORY_AMOUNT", "100"))))
+WATCH_CALL = os.getenv("WATCH_CALL", "S51DG").strip().upper()
 BM_URL = os.getenv("BM_URL", "https://api.brandmeister.network")
 BM_PATH = os.getenv("BM_SOCKET_PATH", "lh/socket.io").lstrip("/")
 status_lock = threading.Lock()
@@ -29,7 +30,9 @@ status = {"connected": False, "last_event_utc": None, "last_error": None,
           "last_target_event": None, "last_rejection": None,
           "sample_event": None, "destination_samples": [], "parse_errors": 0,
           "destination_counts": {}, "event_counts": {}, "last_target_seen_utc": None,
-          "history_queries_sent": 0, "last_history_query_utc": None}
+          "history_queries_sent": 0, "last_history_query_utc": None,
+          "watch_call": WATCH_CALL, "watch_call_events": 0, "watch_call_recent": [],
+          "mqtt_topics": {}, "recent_target_events": []}
 shutdown = threading.Event()
 
 
@@ -83,6 +86,11 @@ def ingest(payload, now=None):
             status["last_target_seen_utc"] = datetime.now(timezone.utc).isoformat()
             status["last_target_event"] = {"tg": tg, "event": str(payload.get("Event")),
                                             "start": payload.get("Start"), "stop": payload.get("Stop")}
+            items = status["recent_target_events"]
+            items.append({"call": str(payload.get("SourceCall")), "tg": tg,
+                          "event": str(payload.get("Event")), "start": payload.get("Start"),
+                          "stop": payload.get("Stop")})
+            del items[:-15]
         # History replies may carry LH-Startup or Session-Update rather than Session-Stop.
         # A strictly positive Stop timestamp determines whether the QSO is complete.
         if as_int(payload.get("Stop")) <= 0:
@@ -123,11 +131,13 @@ def ingest(payload, now=None):
 def request_history(sio):
     # BrandMeister's own Last Heard dashboard issues searchHistory with a query object.
     for tg in sorted(GROUPS):
-        sio.emit("searchHistory", {"query": {"DestinationID": str(tg)}, "amount": HISTORY_AMOUNT})
+        sio.emit("searchHistory", {"query": {"DestinationID": tg}, "amount": HISTORY_AMOUNT})
+    if WATCH_CALL:
+        sio.emit("searchHistory", {"query": {"SourceCall": WATCH_CALL}, "amount": HISTORY_AMOUNT})
     with status_lock:
-        status["history_queries_sent"] += len(GROUPS)
+        status["history_queries_sent"] += len(GROUPS) + bool(WATCH_CALL)
         status["last_history_query_utc"] = datetime.now(timezone.utc).isoformat()
-    log.info("Requested filtered Last Heard history: %s (amount=%d)", sorted(GROUPS), HISTORY_AMOUNT)
+    log.info("Requested filtered Last Heard history: groups=%s call=%s amount=%d", sorted(GROUPS), WATCH_CALL, HISTORY_AMOUNT)
 
 
 def listener():
@@ -153,7 +163,10 @@ def listener():
     def on_mqtt(data):
         try:
             payload = data.get("payload") if isinstance(data, dict) else data
+            topic = str(data.get("topic", "<missing>")) if isinstance(data, dict) else "<not-dict>"
             with status_lock:
+                topics = status["mqtt_topics"]
+                topics[topic] = topics.get(topic, 0) + 1
                 status["last_event_utc"] = datetime.now(timezone.utc).isoformat()
                 status["events_received"] += 1
             try:
@@ -174,6 +187,12 @@ def listener():
                         events[kind] = events.get(kind, 0) + 1
                         if dst not in status["destination_samples"] and len(status["destination_samples"]) < 25:
                             status["destination_samples"].append(dst)
+                        if str(decoded.get("SourceCall", "")).upper() == WATCH_CALL:
+                            status["watch_call_events"] += 1
+                            recent = status["watch_call_recent"]
+                            recent.append({"tg": dst, "event": kind, "start": decoded.get("Start"),
+                                           "stop": decoded.get("Stop"), "topic": topic})
+                            del recent[:-15]
                     ingest(decoded)
                 else:
                     with status_lock:
